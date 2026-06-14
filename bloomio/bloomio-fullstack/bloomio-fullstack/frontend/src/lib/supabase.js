@@ -1,81 +1,144 @@
+// =====================================================================
+// BLOOMIO — lib/supabase.js
+// Helpers para conectar o frontend ao Supabase.
+// Coloque este arquivo em: frontend/src/lib/supabase.js
+// =====================================================================
 import { createClient } from "@supabase/supabase-js";
 
-const url = import.meta.env.VITE_SUPABASE_URL;
-const anon = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const url = import.meta.env.VITE_SUPABASE_URL || "";
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 
-// Só cria o client se as variáveis existirem (assim o app roda em modo demo sem Supabase).
-export const supabase = url && anon ? createClient(url, anon) : null;
-export const hasSupabase = !!supabase;
+export const hasSupabase = !!(url && key);
+export const supabase = hasSupabase ? createClient(url, key) : null;
 
-// Guarda o token de acesso para o frontend mandar à API (header Authorization).
-export async function syncToken() {
-  if (!supabase) return null;
-  const { data } = await supabase.auth.getSession();
-  const token = data?.session?.access_token || "";
-  try { token ? localStorage.setItem("bloomio_token", token) : localStorage.removeItem("bloomio_token"); } catch (e) {}
-  return token;
-}
+// ---------- AUTH ----------
 
-// ---- AUTH ----
 export async function signUp({ email, password, name, business }) {
-  if (!supabase) throw new Error("Supabase não configurado");
   const { data, error } = await supabase.auth.signUp({
-    email, password, options: { data: { name, business } },
+    email,
+    password,
+    options: {
+      data: { name, business }, // vai pro trigger handle_new_user
+    },
   });
   if (error) throw error;
-  await syncToken();
-  return data.user;
+  return data;
 }
 
 export async function signIn({ email, password }) {
-  if (!supabase) throw new Error("Supabase não configurado");
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
   if (error) throw error;
-  await syncToken();
-  return data.user;
+  return data;
 }
 
 export async function signOut() {
-  if (supabase) await supabase.auth.signOut();
-  try { localStorage.removeItem("bloomio_token"); } catch (e) {}
+  await supabase.auth.signOut();
 }
 
 export async function recoverPassword(email) {
-  if (!supabase) throw new Error("Supabase não configurado");
-  const { error } = await supabase.auth.resetPasswordForEmail(email);
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: `${window.location.origin}/reset`,
+  });
   if (error) throw error;
 }
 
-// ---- DADOS (helpers genéricos; a RLS já isola por estabelecimento) ----
-export async function listAll(table) {
-  if (!supabase) return [];
-  const { data, error } = await supabase.from(table).select("*").order("created_at", { ascending: false });
-  if (error) throw error; return data || [];
-}
-export async function insertRow(table, row) {
-  if (!supabase) return null;
-  const { data, error } = await supabase.from(table).insert(row).select().single();
-  if (error) throw error; return data;
-}
-export async function updateRow(table, id, patch) {
-  if (!supabase) return null;
-  const { data, error } = await supabase.from(table).update(patch).eq("id", id).select().single();
-  if (error) throw error; return data;
-}
-export async function deleteRow(table, id) {
-  if (!supabase) return;
-  const { error } = await supabase.from(table).delete().eq("id", id);
-  if (error) throw error;
+export function onAuthChange(callback) {
+  return supabase.auth.onAuthStateChange((_event, session) => {
+    callback(session);
+  });
 }
 
-// Config do estabelecimento (settings) fica em tenants.settings
-export async function loadTenant() {
-  if (!supabase) return null;
-  const { data } = await supabase.from("tenants").select("*").single();
+export async function getSession() {
+  const { data } = await supabase.auth.getSession();
+  return data.session;
+}
+
+// ---------- PERFIL / TENANT ----------
+
+export async function loadProfile() {
+  const { data } = await supabase
+    .from("profiles")
+    .select("*")
+    .single();
   return data;
 }
+
+export async function loadTenant() {
+  const { data } = await supabase
+    .from("tenants")
+    .select("*")
+    .single();
+  return data;
+}
+
 export async function saveTenantSettings(settings) {
-  if (!supabase) return;
-  const { data: t } = await supabase.from("tenants").select("id").single();
-  if (t) await supabase.from("tenants").update({ settings }).eq("id", t.id);
+  const tenant = await loadTenant();
+  if (!tenant) return;
+  const { error } = await supabase
+    .from("tenants")
+    .update({ settings, updated_at: new Date().toISOString() })
+    .eq("id", tenant.id);
+  if (error) throw error;
+}
+
+// ---------- CRUD GENÉRICO ----------
+
+export async function listAll(table, orderBy = "created_at", asc = false) {
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .order(orderBy, { ascending: asc });
+  if (error) throw error;
+  return data || [];
+}
+
+export async function insertRow(table, row) {
+  // tenant_id é preenchido automaticamente pelo RLS/trigger
+  const clean = { ...row };
+  delete clean.id; // deixa o Postgres gerar
+  delete clean.tenant_id; // o RLS cuida
+  const { data, error } = await supabase
+    .from(table)
+    .insert(clean)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function updateRow(table, id, changes) {
+  const clean = { ...changes };
+  delete clean.tenant_id;
+  const { data, error } = await supabase
+    .from(table)
+    .update(clean)
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function deleteRow(table, id) {
+  const { error } = await supabase
+    .from(table)
+    .delete()
+    .eq("id", id);
+  if (error) throw error;
+}
+
+// ---------- STORAGE (avatares/logos) ----------
+
+export async function uploadImage(file, path) {
+  const ext = file.name.split(".").pop();
+  const filePath = `${path}/${Date.now()}.${ext}`;
+  const { error } = await supabase.storage
+    .from("avatars")
+    .upload(filePath, file, { upsert: true });
+  if (error) throw error;
+  const { data } = supabase.storage.from("avatars").getPublicUrl(filePath);
+  return data.publicUrl;
 }
